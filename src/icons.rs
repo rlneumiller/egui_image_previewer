@@ -167,7 +167,7 @@ impl IconRenderer {
                                 icon, SvgIcons::get_available_icons());
                         // Mark this icon as failed to avoid repeated warnings
                         self.cache.insert(format!("failed_{}", icon), 
-                            ctx.load_texture("placeholder", egui::ColorImage::new([1, 1], egui::Color32::TRANSPARENT), egui::TextureOptions::default()));
+                            ctx.load_texture("placeholder", egui::ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 0]), egui::TextureOptions::default()));
                     }
                 }
             }
