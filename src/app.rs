@@ -1,6 +1,9 @@
 //! Main application UI and logic
 
 use std::path::PathBuf;
+
+// Using Multiple Producer, Single Consumer for asynchronous, thread‑safe communication between our UI and image loading threads
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
 use eframe::egui;
 use egui::TextureHandle;
@@ -9,7 +12,14 @@ use glob::glob;
 use crate::settings::ImageLoadingSettings;
 use crate::benchmark::{PerformanceProfile, SystemPerformanceCategory, run_simple_cpu_benchmark};
 use crate::file_locality::FileInfo;
-use crate::image_processing::{should_skip_large_file, load_svg_image, load_raster_image, estimate_image_render_time};
+use crate::image_processing::{
+    should_skip_large_file,
+    load_svg_image,
+    load_raster_image,
+    estimate_image_render_time,
+    ImageLoadStage,
+    ImageLoadUpdate,
+};
 use crate::icons::IconRenderer;
 
 pub struct ImageViewerApp {
@@ -25,6 +35,11 @@ pub struct ImageViewerApp {
     pub benchmark_threshold_ms: f64,
     pub run_benchmark_trigger: bool,
     pub auto_benchmark_on_startup: bool,
+    pub load_image_sender: Sender<ImageLoadUpdate>,
+    pub load_image_receiver: Receiver<ImageLoadUpdate>,
+    pub current_load_id: u64,
+    pub loading_image: bool,
+    pub loading_path: Option<PathBuf>,
     // New fields for user confirmation dialog
     pub show_slow_image_dialog: bool,
     pub pending_slow_image_path: Option<PathBuf>,
@@ -48,6 +63,8 @@ impl Default for ImageViewerApp {
             }
         }
 
+        let (load_image_sender, load_image_receiver) = std::sync::mpsc::channel::<ImageLoadUpdate>();
+
         Self {
             file_infos,
             selected_image_index: None,
@@ -66,20 +83,27 @@ impl Default for ImageViewerApp {
             pending_slow_image_estimated_time: 0.0,
             show_download_dialog: false,
             pending_download_file: None,
+            load_image_sender,
+            load_image_receiver,
+            current_load_id: 0,
+            loading_image: false,
+            loading_path: None,
             icon_renderer: IconRenderer::new(),
         }
     }
 }
 
 impl eframe::App for ImageViewerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.render_top_menu(ctx);
-        self.render_settings_window(ctx);
-        self.render_benchmark_window(ctx);
-        self.render_main_panel(ctx);
-        self.handle_keyboard_nav(ctx);
-        self.handle_benchmark_trigger(ctx);
-        self.handle_dialogs(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.poll_image_load_result(&ctx);
+        self.render_top_menu(ui, &ctx);
+        self.render_settings_window(&ctx);
+        self.render_benchmark_window(&ctx);
+        self.render_main_panel(ui, &ctx);
+        self.handle_keyboard_nav(&ctx);
+        self.handle_benchmark_trigger(&ctx);
+        self.handle_dialogs(&ctx);
     }
 }
 
@@ -118,9 +142,9 @@ impl ImageViewerApp {
         }
     }
 
-    fn render_top_menu(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
+    fn render_top_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        egui::Panel::top("top_panel").show_inside(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("Settings", |ui| {
                     if ui.button("Image Loading Settings").clicked() {
                         self.show_settings = !self.show_settings;
@@ -382,15 +406,15 @@ impl ImageViewerApp {
         }
     }
 
-    fn render_main_panel(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn render_main_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             self.render_file_list(ui, ctx);
             self.render_image_display(ui);
         });
     }
 
     fn render_file_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        egui::SidePanel::left("image_list_panel")
+        egui::Panel::left("image_list_panel")
             .resizable(true)
             .show_inside(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -421,7 +445,7 @@ impl ImageViewerApp {
                                 crate::file_locality::FileLocalityStatus::OnDemand => egui::Color32::LIGHT_BLUE,
                                 crate::file_locality::FileLocalityStatus::Unknown => egui::Color32::GRAY,
                             };
-                            self.icon_renderer.icon_label(ui, ctx, file_info.locality_status.icon(), 16.0, locality_color)
+                            self.icon_renderer.icon_label(ui, ctx, file_info.locality_status.icon_name(), 16.0, locality_color)
                                 .on_hover_text(format!(
                                     "{}\n{}",
                                     file_info.locality_status.description(),
@@ -487,7 +511,7 @@ impl ImageViewerApp {
                         });
                     }
                     if changed {
-                        self.load_selected_image(ctx);
+                        self.load_selected_image(ui.ctx());
                     }
                 });
             });
@@ -503,7 +527,15 @@ impl ImageViewerApp {
             
             frame.show(ui, |ui| {
                 ui.vertical_centered(|ui| {
-                    if let Some(texture) = &self.image_texture {
+                    if self.loading_image {
+                        ui.label(&self.status_text);
+                        ui.add(
+                            egui::ProgressBar::new(0.0)
+                                .animate(true)
+                                .show_percentage()
+                                .text("Loading image...")
+                        );
+                    } else if let Some(texture) = &self.image_texture {
                         if self.settings.auto_scale_to_fit {
                             // Calculate available space for the image
                             let available_size = ui.available_size();
@@ -584,6 +616,67 @@ impl ImageViewerApp {
     fn handle_dialogs(&mut self, ctx: &egui::Context) {
         self.handle_slow_image_dialog(ctx);
         self.handle_download_dialog(ctx);
+    }
+
+    fn poll_image_load_result(&mut self, ctx: &egui::Context) {
+        while let Ok(update) = self.load_image_receiver.try_recv() {
+            match update {
+                ImageLoadUpdate::Stage { load_id, stage } => {
+                    if load_id != self.current_load_id {
+                        continue;
+                    }
+                    if let Some(path) = &self.loading_path {
+                        let filename = path.file_name()
+                            .map(|f| f.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.to_string_lossy().to_string());
+                        let display_filename = self.settings.truncate_filename(&filename);
+                        self.loading_image = true;
+                        self.status_text = match stage {
+                            ImageLoadStage::Loading => format!("Loading: {}", display_filename),
+                            ImageLoadStage::Decoding => format!("Decoding: {}", display_filename),
+                            ImageLoadStage::Scaling => format!("Scaling: {}", display_filename),
+                            ImageLoadStage::Uploading => format!("Uploading: {}", display_filename),
+                        };
+                    }
+                }
+                ImageLoadUpdate::Result { load_id, result } => {
+                    if load_id != self.current_load_id {
+                        continue;
+                    }
+                    self.loading_image = false;
+                    let loading_path = self.loading_path.take();
+
+                    match result {
+                        Ok(load_data) => {
+                            if let Some(path) = &loading_path {
+                                let filename = path.file_name()
+                                    .map(|f| f.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| path.to_string_lossy().to_string());
+                                let display_filename = self.settings.truncate_filename(&filename);
+                                self.status_text = format!("Uploading: {}", display_filename);
+                            }
+
+                            let texture = ctx.load_texture(load_data.texture_name, load_data.color_image, Default::default());
+                            self.image_texture = Some(texture);
+
+                            if let Some(path) = loading_path {
+                                let filename = path.file_name()
+                                    .map(|f| f.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| path.to_string_lossy().to_string());
+                                let display_filename = self.settings.truncate_filename(&filename);
+                                let suffix = load_data.status_suffix.unwrap_or_default();
+                                self.status_text = format!("Loaded: {}{}", display_filename, suffix);
+                                self.update_file_locality_status(&path);
+                            }
+                        }
+                        Err(error_message) => {
+                            self.image_texture = None;
+                            self.status_text = format!("Error loading image: {}", error_message);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn handle_slow_image_dialog(&mut self, ctx: &egui::Context) {
@@ -755,43 +848,37 @@ impl ImageViewerApp {
                 if let Some(skip_message) = should_skip_large_file(&path, &self.settings, true) {
                     self.status_text = skip_message;
                     self.image_texture = None;
+                    self.loading_image = false;
+                    self.loading_path = None;
                     return;
                 }
 
-                let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                
-                let result = if extension == "svg" {
-                    load_svg_image(&path, &self.settings, ctx, true)
-                } else {
-                    load_raster_image(&path, &self.settings, ctx, true)
-                };
+                let filename = path.file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.to_string_lossy().to_string());
+                let display_filename = self.settings.truncate_filename(&filename);
+                self.status_text = format!("Loading: {}", display_filename);
+                self.loading_image = true;
+                self.image_texture = None;
+                self.loading_path = Some(path.clone());
 
-                match result {
-                    Ok(texture) => {
-                        self.image_texture = Some(texture);
-                        let recolor_suffix = if extension == "svg" && self.settings.svg_recolor_enabled {
-                            " (recolored)"
-                        } else {
-                            ""
-                        };
-                        let filename = path.file_name()
-                            .map(|f| f.to_string_lossy().to_string())
-                            .unwrap_or_else(|| path.to_string_lossy().to_string());
-                        let display_filename = self.settings.truncate_filename(&filename);
-                        self.status_text = format!("Loaded: {}{}", display_filename, recolor_suffix);
-                        
-                        // Update file locality status after successful load (in case it was downloaded)
-                        self.update_file_locality_status(&path);
-                    }
-                    Err(e) => {
-                        self.image_texture = None;
-                        let filename = path.file_name()
-                            .map(|f| f.to_string_lossy().to_string())
-                            .unwrap_or_else(|| path.to_string_lossy().to_string());
-                        let display_filename = self.settings.truncate_filename(&filename);
-                        self.status_text = format!("Error loading {}: {}", display_filename, e);
-                    }
-                }
+                let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                self.current_load_id = self.current_load_id.wrapping_add(1);
+                let load_id = self.current_load_id;
+                let sender = self.load_image_sender.clone();
+                let settings = self.settings.clone();
+
+                std::thread::spawn(move || {
+                    let _ = sender.send(ImageLoadUpdate::Stage { load_id, stage: ImageLoadStage::Loading });
+                    let result = if extension == "svg" {
+                        load_svg_image(&path, &settings, true, Some(&sender), load_id)
+                    } else {
+                        load_raster_image(&path, &settings, true, Some(&sender), load_id)
+                    };
+                    let _ = sender.send(ImageLoadUpdate::Result { load_id, result });
+                });
+
+                ctx.request_repaint();
             }
         }
     }

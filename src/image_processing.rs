@@ -1,15 +1,38 @@
 //! Image loading and processing functionality
 
 use std::path::PathBuf;
+use std::sync::mpsc::Sender;  // Multiple Producer, Single Consumer
 use eframe::egui;
-use egui::{ColorImage, TextureHandle};
+use egui::ColorImage;
 use image::ImageReader;
 use resvg;
 use regex;
+use turbojpeg::{Decompressor, Image as TurboImage, PixelFormat};
 
 use crate::settings::ImageLoadingSettings;
 use crate::file_locality::FileInfo;
 use crate::benchmark::ImageCharacteristics;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageLoadStage {
+    Loading,
+    Decoding,
+    Scaling,
+    Uploading,
+}
+
+#[derive(Debug)]
+pub enum ImageLoadUpdate {
+    Stage { load_id: u64, stage: ImageLoadStage },
+    Result { load_id: u64, result: Result<ImageLoadResult, String> },
+}
+
+#[derive(Debug)]
+pub struct ImageLoadResult {
+    pub color_image: ColorImage,
+    pub texture_name: String,
+    pub status_suffix: Option<String>,
+}
 
 pub fn should_skip_large_file(path: &PathBuf, settings: &ImageLoadingSettings, force_load: bool) -> Option<String> {
     // Check file locality status first to avoid any potential file access issues (unless forced)
@@ -65,7 +88,14 @@ pub fn scale_image_if_needed(img: image::DynamicImage, settings: &ImageLoadingSe
         let new_width = (width as f32 * scale_factor) as u32;
         let new_height = (height as f32 * scale_factor) as u32;
 
-        Ok(img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3))
+        // Use a faster scaling path for very large images.
+        // Triangle interpolation is much faster than Lanczos3 while still giving reasonable results,
+        // and thumbnail is often faster for large downscales than a full high-quality resize.
+        if width > 12000 || height > 12000 || scale_factor < 0.6 {
+            Ok(img.thumbnail(new_width, new_height))
+        } else {
+            Ok(img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3))
+        }
     } else {
         Err(format!(
             "Image too large ({}x{} > {}x{} threshold) and auto-scaling disabled", 
@@ -133,34 +163,85 @@ pub fn recolor_svg_simple(svg_content: &str, settings: &ImageLoadingSettings) ->
     result
 }
 
-pub fn load_svg_image(path: &PathBuf, settings: &ImageLoadingSettings, ctx: &egui::Context, force_load: bool) -> Result<TextureHandle, String> {
+fn is_jpeg_path(path: &PathBuf) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg"))
+        .unwrap_or(false)
+}
+
+fn load_jpeg_via_turbojpeg(path: &PathBuf) -> Result<image::DynamicImage, String> {
+    let jpeg_data = std::fs::read(path)
+        .map_err(|e| format!("Failed to read JPEG file: {}", e))?;
+
+    let mut decompressor = Decompressor::new()
+        .map_err(|e| format!("TurboJPEG init failed: {}", e))?;
+    let header = decompressor.read_header(&jpeg_data)
+        .map_err(|e| format!("TurboJPEG header read failed: {}", e))?;
+
+    let width = header.width as u32;
+    let height = header.height as u32;
+    let pitch = header.width * PixelFormat::RGBA.size();
+    let mut image_data = vec![0; pitch * header.height];
+
+    let turbo_image = TurboImage {
+        pixels: &mut image_data[..],
+        width: header.width,
+        pitch,
+        height: header.height,
+        format: PixelFormat::RGBA,
+    };
+
+    decompressor.decompress(&jpeg_data, turbo_image)
+        .map_err(|e| format!("TurboJPEG decode failed: {}", e))?;
+
+    let rgba_image = image::RgbaImage::from_raw(width, height, image_data)
+        .ok_or_else(|| "TurboJPEG produced invalid RGBA buffer".to_string())?;
+    Ok(image::DynamicImage::ImageRgba8(rgba_image))
+}
+
+/// Loads an SVG image - recolor and scale as needed, while respecting file locality to avoid triggering downloads.
+pub fn load_svg_image(
+    path: &PathBuf,
+    settings: &ImageLoadingSettings,
+    force_load: bool,
+    stage_sender: Option<&Sender<ImageLoadUpdate>>,
+    load_id: u64,
+) -> Result<ImageLoadResult, String> {
     // Check file locality status first to avoid triggering downloads (unless forced)
     if !force_load {
         let file_info = FileInfo::new(path.clone());
         if file_info.will_trigger_download() {
-            return Err("Cannot load on-demand file - would trigger download".to_string());
+            return Err("This is an on-demand file - would trigger download".to_string());
         }
     }
     
+    if let Some(sender) = stage_sender {
+        let _ = sender.send(ImageLoadUpdate::Stage { load_id, stage: ImageLoadStage::Loading });
+    }
+
+    let start = std::time::Instant::now();
     let svg_content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read SVG file: {}", e))?;
 
     // Apply recoloring if enabled
     let processed_svg = recolor_svg_simple(&svg_content, settings);
-    let svg_bytes = processed_svg.as_bytes();
     
-    let mut fontdb = resvg::usvg::fontdb::Database::new();
-    fontdb.load_system_fonts();
-    
-    let options = resvg::usvg::Options {
-        fontdb: std::sync::Arc::new(fontdb),
-        ..Default::default()
-    };
-    
-    let tree = resvg::usvg::Tree::from_data(svg_bytes, &options)
+    if let Some(sender) = stage_sender {
+        let _ = sender.send(ImageLoadUpdate::Stage {
+            load_id,
+            stage: ImageLoadStage::Decoding,
+        });
+    }
+
+    let options = resvg::usvg::Options::default();
+    let usvg_tree = resvg::usvg::Tree::from_str(&processed_svg, &options)
         .map_err(|e| format!("Failed to parse SVG: {}", e))?;
     
-    let bbox = tree.size();
+    let decode_time = start.elapsed();
+    eprintln!("[ImageLoad] decode {:?} ms for {}", decode_time.as_millis(), path.display());
+
+    let bbox = usvg_tree.size();
     let width = bbox.width() as u32;
     let height = bbox.height() as u32;
     
@@ -168,6 +249,9 @@ pub fn load_svg_image(path: &PathBuf, settings: &ImageLoadingSettings, ctx: &egu
     const LARGE_SVG_THRESHOLD: u32 = 4096;
     let (scaled_width, scaled_height) = if width > LARGE_SVG_THRESHOLD || height > LARGE_SVG_THRESHOLD {
         if settings.auto_scale_large_images {
+            if let Some(sender) = stage_sender {
+                let _ = sender.send(ImageLoadUpdate::Stage { load_id, stage: ImageLoadStage::Scaling });
+            }
             let scale_factor = (LARGE_SVG_THRESHOLD as f32 / width.max(height) as f32).min(1.0);
             ((width as f32 * scale_factor) as u32, (height as f32 * scale_factor) as u32)
         } else {
@@ -180,11 +264,14 @@ pub fn load_svg_image(path: &PathBuf, settings: &ImageLoadingSettings, ctx: &egu
     let mut pixmap = resvg::tiny_skia::Pixmap::new(scaled_width, scaled_height)
         .ok_or("Failed to create pixmap")?;
     
+    let scale_start = std::time::Instant::now();
     let scale_x = scaled_width as f32 / width as f32;
     let scale_y = scaled_height as f32 / height as f32;
     let transform = resvg::tiny_skia::Transform::from_scale(scale_x, scale_y);
     
-    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    resvg::render(&usvg_tree, transform, &mut pixmap.as_mut());
+    let scale_time = scale_start.elapsed();
+    eprintln!("[ImageLoad] svg render/scale {:?} ms for {}", scale_time.as_millis(), path.display());
     
     // Convert to RGBA
     let rgba_data: Vec<u8> = pixmap.data()
@@ -197,32 +284,71 @@ pub fn load_svg_image(path: &PathBuf, settings: &ImageLoadingSettings, ctx: &egu
         &rgba_data,
     );
     
-    let texture_name = format!("svg_{}", path.file_name().unwrap_or_default().to_string_lossy());
-    let recolor_suffix = if settings.svg_recolor_enabled { "_recolored" } else { "" };
-    
-    Ok(ctx.load_texture(
-        format!("{}{}", texture_name, recolor_suffix),
+    let texture_name = format!("svg_{}{}", path.file_name().unwrap_or_default().to_string_lossy(), if settings.svg_recolor_enabled { "_recolored" } else { "" });
+    let status_suffix = if settings.svg_recolor_enabled {
+        Some(" (recolored)".to_string())
+    } else {
+        None
+    };
+
+    Ok(ImageLoadResult {
         color_image,
-        Default::default(),
-    ))
+        texture_name,
+        status_suffix,
+    })
 }
 
-pub fn load_raster_image(path: &PathBuf, settings: &ImageLoadingSettings, ctx: &egui::Context, force_load: bool) -> Result<TextureHandle, String> {
+pub fn load_raster_image(
+    path: &PathBuf,
+    settings: &ImageLoadingSettings,
+    force_load: bool,
+    stage_sender: Option<&Sender<ImageLoadUpdate>>,
+    load_id: u64,
+) -> Result<ImageLoadResult, String> {
     // Check file locality status first to avoid triggering downloads (unless forced)
     if !force_load {
         let file_info = FileInfo::new(path.clone());
         if file_info.will_trigger_download() {
-            return Err("Cannot load on-demand file - would trigger download".to_string());
+            return Err("This is an on-demand file - would trigger download".to_string());
         }
     }
     
-    let img = ImageReader::open(path)
-        .map_err(|e| format!("Failed to open image: {}", e))?
-        .decode()
-        .map_err(|e| format!("Failed to decode image: {}", e))?;
+    if let Some(sender) = stage_sender {
+        let _ = sender.send(ImageLoadUpdate::Stage { load_id, stage: ImageLoadStage::Loading });
+    }
+    let start = std::time::Instant::now();
+    if let Some(sender) = stage_sender {
+        let _ = sender.send(ImageLoadUpdate::Stage {
+            load_id,
+            stage: ImageLoadStage::Decoding,
+        });
+    }
+
+    let img = if is_jpeg_path(path) {
+        load_jpeg_via_turbojpeg(path)?
+    } else {
+        ImageReader::open(path)
+            .map_err(|e| format!("Failed to open image: {}", e))?
+            .decode()
+            .map_err(|e| format!("Failed to decode image: {}", e))?
+    };
     
-    // Apply scaling if needed
+    let decode_time = start.elapsed();
+    eprintln!("[ImageLoad] decode {:?} ms for {}", decode_time.as_millis(), path.display());
+
+    let (width, height) = (img.width(), img.height());
+    if (width > 8192 || height > 8192) && settings.auto_scale_large_images {
+        if let Some(sender) = stage_sender {
+            let _ = sender.send(ImageLoadUpdate::Stage { load_id, stage: ImageLoadStage::Scaling });
+        }
+    }
+    let scale_start = std::time::Instant::now();
     let scaled_img = scale_image_if_needed(img, settings)?;
+    let scale_time = scale_start.elapsed();
+    eprintln!("[ImageLoad] raster scale {:?} ms for {}", scale_time.as_millis(), path.display());
+    
+    let decode_and_scale_time = start.elapsed();
+    eprintln!("[ImageLoad] raster decode+scale {:?} ms for {}", decode_and_scale_time.as_millis(), path.display());
     
     let size = [scaled_img.width() as _, scaled_img.height() as _];
     let rgba = scaled_img.to_rgba8();
@@ -230,12 +356,12 @@ pub fn load_raster_image(path: &PathBuf, settings: &ImageLoadingSettings, ctx: &
     let color_image = ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
     
     let texture_name = format!("image_{}", path.file_name().unwrap_or_default().to_string_lossy());
-    
-    Ok(ctx.load_texture(
-        texture_name,
+
+    Ok(ImageLoadResult {
         color_image,
-        Default::default(),
-    ))
+        texture_name,
+        status_suffix: None,
+    })
 }
 
 pub fn estimate_image_render_time(path: &PathBuf, performance_profile: &crate::benchmark::PerformanceProfile) -> Option<f64> {

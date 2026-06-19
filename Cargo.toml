@@ -1,6 +1,6 @@
 [package]
-name = "image_previewer"
-version = "0.1.0"
+name = "neu-image-previewer"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
@@ -14,15 +14,16 @@ edition = "2024"
 # include_dir = "0.7.4"
 # sysinfo = "0.30"
 
-eframe = "*"
-egui = "*"
-egui_extras = { version = "*", features = ["all_loaders"] }
-image = "*"
-glob = "*"
-resvg = "*"
-regex = "*"
-include_dir = "*"
-sysinfo = "*"
+eframe = "0.34.2"
+egui = "0.34.2"
+egui_extras = { version = "0.34.2", features = ["all_loaders"] }
+image = "0.25.10"
+turbojpeg = { version = "1.4.0", default-features = false, features = ["cmake"] }
+glob = "0.3.3"
+resvg = "0.47.0"
+regex = "1.12.3"
+include_dir = "0.7.4"
+sysinfo = "0.39.2"
 
 [target.'cfg(windows)'.dependencies]
 # windows = { version = "0.58", features = [
@@ -31,7 +32,7 @@ sysinfo = "*"
 #     "Win32_Foundation"
 # ]}
 
-windows = { version = "*", features = [
+windows = { version = "0.61.2", features = [
     "Win32_Storage_CloudFilters",
     "Win32_Storage_FileSystem",
     "Win32_Foundation"

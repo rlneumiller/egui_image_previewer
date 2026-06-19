@@ -21,6 +21,14 @@ impl FileLocalityStatus {
             FileLocalityStatus::Unknown => "❓",
         }
     }
+
+    pub fn icon_name(&self) -> &'static str {
+        match self {
+            FileLocalityStatus::Local => "device-floppy",
+            FileLocalityStatus::OnDemand => "cloud",
+            FileLocalityStatus::Unknown => "help",
+        }
+    }
     
     pub fn description(&self) -> &'static str {
         match self {

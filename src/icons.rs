@@ -76,7 +76,7 @@ impl SvgIcons {
         // Parse SVG with error handling
         let opt = usvg::Options::default();
         
-        let tree = match usvg::Tree::from_str(&colored_svg, &opt) {
+        let usvg_tree = match usvg::Tree::from_str(&colored_svg, &opt) {
             Ok(tree) => tree,
             Err(e) => {
                 eprintln!("Error parsing SVG for icon '{}': {}", icon_name, e);
@@ -94,7 +94,7 @@ impl SvgIcons {
             }
         };
         
-        resvg::render(&tree, resvg::tiny_skia::Transform::default(), &mut pixmap.as_mut());
+        resvg::render(&usvg_tree, resvg::tiny_skia::Transform::default(), &mut pixmap.as_mut());
         
         // Convert to egui texture
         let image = egui::ColorImage::from_rgba_unmultiplied(

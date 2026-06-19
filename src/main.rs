@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
 use eframe::egui;
-use image_previewer::ImageViewerApp;
+use neu_image_previewer::ImageViewerApp;
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {

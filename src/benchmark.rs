@@ -125,7 +125,6 @@ pub struct PerformanceProfile {
     pub benchmark_results: Vec<BenchmarkResult>,
     pub system_capabilities: SystemCapabilities,
     pub last_benchmark_time: Option<Instant>,
-    pub reference_comparison: Option<PerformanceComparison>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,12 +133,6 @@ pub struct SystemCapabilities {
     pub avg_decode_time_per_mp: f64, // milliseconds per megapixel
     pub avg_texture_time_per_mp: f64,
     pub format_performance: HashMap<String, f64>, // format -> avg time per MP
-}
-
-#[derive(Debug, Clone)]
-pub struct PerformanceComparison {
-    pub performance_ratio: f64, // Current machine performance relative to baseline (1.0 = same, 0.5 = half speed, 2.0 = twice as fast)
-    pub confidence_level: f64,  // 0.0 to 1.0, how confident we are in the estimate
 }
 
 impl Default for PerformanceProfile {
@@ -153,7 +146,6 @@ impl Default for PerformanceProfile {
                 format_performance: HashMap::new(),
             },
             last_benchmark_time: None,
-            reference_comparison: None,
         }
     }
 }
@@ -224,14 +216,14 @@ impl PerformanceProfile {
                 self.system_capabilities.format_performance.insert(format, total_time / total_mp);
             }
         }
+
     }
     
     pub fn estimate_render_time(&self, characteristics: &ImageCharacteristics) -> f64 {
         if self.benchmark_results.is_empty() {
             return 0.0; // No data available
         }
-        
-        // Get format-specific performance if available
+
         let time_per_mp = self.system_capabilities.format_performance
             .get(&characteristics.format)
             .copied()
@@ -491,6 +483,7 @@ pub fn benchmark_image(path: &PathBuf, ctx: &egui::Context) -> BenchmarkResult {
         .map_err(|e| format!("Failed to open image: {}", e))
         .and_then(|reader| reader.decode().map_err(|e| format!("Failed to decode image: {}", e)));
     let decode_time = decode_start.elapsed();
+    let decode_ms = decode_time.as_secs_f64() * 1000.0;
     
     match decode_result {
         Ok(img) => {
@@ -507,7 +500,7 @@ pub fn benchmark_image(path: &PathBuf, ctx: &egui::Context) -> BenchmarkResult {
             match texture_result {
                 Ok(_) => BenchmarkResult {
                     characteristics,
-                    decode_time_ms: decode_time.as_secs_f64() * 1000.0,
+                    decode_time_ms: decode_ms,
                     texture_creation_time_ms: texture_time.as_secs_f64() * 1000.0,
                     total_time_ms: total_time.as_secs_f64() * 1000.0,
                     success: true,
@@ -515,7 +508,7 @@ pub fn benchmark_image(path: &PathBuf, ctx: &egui::Context) -> BenchmarkResult {
                 },
                 Err(e) => BenchmarkResult {
                     characteristics,
-                    decode_time_ms: decode_time.as_secs_f64() * 1000.0,
+                    decode_time_ms: decode_ms,
                     texture_creation_time_ms: texture_time.as_secs_f64() * 1000.0,
                     total_time_ms: total_time.as_secs_f64() * 1000.0,
                     success: false,
@@ -540,7 +533,7 @@ pub fn benchmark_image(path: &PathBuf, ctx: &egui::Context) -> BenchmarkResult {
                     format,
                     bit_depth: None,
                 },
-                decode_time_ms: decode_time.as_secs_f64() * 1000.0,
+                decode_time_ms: decode_ms,
                 texture_creation_time_ms: 0.0,
                 total_time_ms: total_time.as_secs_f64() * 1000.0,
                 success: false,
